@@ -1,53 +1,25 @@
 local M = {}
-M.initialized = false
 
 local MMC_CONSISTENT_BUCKETS = 65536
-
-local HASH_PEERS = {}
-local CONTINUUM = {}
-local BUCKETS = {}
 
 local function hash_fn(key)
 	local md5 = ngx.md5_bin(key) --nginx only
 	return ngx.crc32_long(md5) --nginx only
 end
 
---in-place quicksort
-local function quicksort(t, start, endi)
-	start, endi = start or 1, endi or #t
-	--partition w.r.t. first element
-	if(endi - start < 2) then return t end
-	local pivot = start
-	for i = start + 1, endi do
-		if t[i][2] < t[pivot][2] then
-			local temp = t[pivot + 1]
-			t[pivot + 1] = t[pivot]
-			if(i == pivot + 1) then
-				t[pivot] = temp
-			else
-				t[pivot] = t[i]
-				t[i] = temp
-			end
-			pivot = pivot + 1
-		end
-	end
-	t = quicksort(t, start, pivot - 1)
-	return quicksort(t, pivot + 1, endi)
-end
-
-local function chash_find(point)
-	local mid, lo, hi = 1, 1, #CONTINUUM
+local function chash_find(point, map)
+	local mid, lo, hi = 1, 1, #map
 	while 1 do
-		if point <= CONTINUUM[lo][2] or point > CONTINUUM[hi][2] then
-			return CONTINUUM[lo]
+		if point <= map[lo][2] or point > map[hi][2] then
+			return map[lo][1]
 		end
 
 		mid = math.floor(lo + (hi-lo)/2)
-		if point <= CONTINUUM[mid][2] and point > (mid and CONTINUUM[mid-1][2] or 0) then
-			return CONTINUUM[mid]
+		if point <= map[mid][2] and point > (mid and map[mid-1][2] or 0) then
+			return map[mid][1]
 		end
 
-		if CONTINUUM[mid][2] < point then
+		if map[mid][2] < point then
 			lo = mid + 1
 		else
 			hi = mid - 1
@@ -55,55 +27,55 @@ local function chash_find(point)
 	end
 end
 
+local function comp(p, c) return p[2] < c[2] end
+
 local function chash_init()
-
-	local n = #HASH_PEERS
-
-	local ppn = math.floor(MMC_CONSISTENT_BUCKETS / n)
-	if ppn == 0 then
-		ppn = 1
-	end
+	
+	local ppn = math.floor(MMC_CONSISTENT_BUCKETS / 10)
 
 	local C = {}
-	for i,peer in ipairs(HASH_PEERS) do
-		for k=1, math.floor(ppn * peer[1]) do
-			local hash_data = peer[2] .. "-"..tostring(math.floor(k - 1))
-			table.insert(C, {peer[2], hash_fn(hash_data)})
+	for i,peer in ipairs(ngx.shared.hashpeers:get_keys()) do
+		for k=1, math.floor(ppn) do
+			local hash_data = peer .. "-"..tostring(math.floor(k - 1))
+			table.insert(C, {peer , hash_fn(hash_data)})
 		end
 	end
 
-	CONTINUUM = quicksort(C, 1, #C)
+	table.sort(C, comp)
 
 	local step = math.floor(0xFFFFFFFF / MMC_CONSISTENT_BUCKETS)
 
-	BUCKETS = {}
+	ngx.shared.buckets:flush_all()
 	for i=1, MMC_CONSISTENT_BUCKETS do
-		table.insert(BUCKETS, i, chash_find(math.floor(step * (i - 1))))
+		ngx.shared.buckets:set(i-1, chash_find(math.floor(step * (i - 1)), C))
 	end
 
-	M.initialized = true
 end
 
 local function chash_get_upstream(key)
-	if not M.initialized then
-		chash_init()
-	end
-
-	local point = math.floor(ngx.crc32_long(key)) --nginx only
-
-	local tries = #HASH_PEERS
-	point = point + (89 * tries)
-
-	return BUCKETS[point % MMC_CONSISTENT_BUCKETS][1]
+	local point = hash_fn(key) --nginx only
+	return	ngx.shared.buckets:get(point % MMC_CONSISTENT_BUCKETS)
 end
 M.get_upstream = chash_get_upstream
 
-local function chash_add_upstream(upstream, weigth)
-	M.initialized = false
-
-	weight = weight or 1
-	table.insert(HASH_PEERS, {weight, upstream})
+local function chash_add_upstream(upstream)
+	local before_count = table.getn(ngx.shared.hashpeers:get_keys())
+	ngx.shared.hashpeers:set(upstream, upstream)
+	local after_count = table.getn(ngx.shared.hashpeers:get_keys())
+	if after_count ~= before_count then
+		chash_init()
+	end
 end
 M.add_upstream = chash_add_upstream
+
+local function chash_remove_upstream(upstream)
+	local before_count = table.getn(ngx.shared.hashpeers:get_keys())
+	ngx.shared.hashpeers:delete(upstream)
+	local after_count = table.getn(ngx.shared.hashpeers:get_keys())
+	if after_count ~= before_count then
+		chash_init()
+	end
+end
+M.remove_upstream = chash_remove_upstream
 
 return M
